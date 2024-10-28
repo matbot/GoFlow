@@ -1,6 +1,6 @@
 package main
 
-import "GoFlow/cmd"
+import "github.com/matbot/goflow/cmd"
 
 func main() {
 	cmd.Execute()

@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"GoFlow/workflow"
 	"fmt"
+	"github.com/matbot/goflow/workflow"
 	"github.com/spf13/cobra"
 	"os"
 )

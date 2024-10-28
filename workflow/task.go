@@ -2,34 +2,39 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"gopkg.in/yaml.v2"
-	"io/ioutil"
+	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Task represents a single task in the workflow
 type Task struct {
 	Name      string   `yaml:"task"`
-	Type      string   `yaml:"type"`
-	Command   string   `yaml:"command"`
-	DependsOn []string `yaml:"depends_on,omitempty"`
-	Timeout   string   `yaml:"timeout,omitempty"`
-	Retries   int      `yaml:"retries,omitempty"`
+	Type      string   `yaml:"type"`       // "shell", "db", "http"
+	Command   string   `yaml:"command"`    // Shell command or SQL query
+	URL       string   `yaml:"url"`        // HTTP URL
+	Method    string   `yaml:"method"`     // HTTP method (GET, POST)
+	Body      string   `yaml:"body"`       // HTTP request body
+	DependsOn []string `yaml:"depends_on"` // Dependencies
+	Timeout   string   `yaml:"timeout"`    // Timeout for task
+	Schedule  string   `yaml:"schedule"`   // Scheduled hr:mm
+	Retries   int      `yaml:"retries"`    // Number of retries
+	DbConn    string   `yaml:"db_conn"`    // DB connection string
 }
 
-// Workflow represents a collection of tasks
 type Workflow struct {
 	Tasks []Task `yaml:"workflow"`
 }
 
-// ExecuteWorkflow loads and runs the tasks from the YAML workflow file
 func ExecuteWorkflow(filename string) error {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("failed to read workflow file: %v", err)
 	}
@@ -44,75 +49,11 @@ func ExecuteWorkflow(filename string) error {
 	return nil
 }
 
-// findTaskByName finds a task by its name
-func findTaskByName(tasks []Task, name string) *Task {
-	for _, task := range tasks {
-		if task.Name == name {
-			return &task
-		}
-	}
-	return nil
-}
-
-func executeWithRetries(task Task) bool {
-	retryCount := 0
-	for {
-		if retryCount > task.Retries {
-			fmt.Printf("Task %s exceeded retry limit %d.\n", task.Name, task.Retries)
-			return false
-		}
-
-		err := executeTask(task)
-		if err == nil {
-			fmt.Printf("Task %s executed successfully.\n", task.Name)
-			return true
-		}
-
-		fmt.Printf("Task %s failed: %v. Retrying...\n", task.Name, err)
-		retryCount++
-		// exponential backoff
-		time.Sleep(time.Duration(2^retryCount) * time.Second)
-	}
-}
-
-func executeTask(task Task) error {
-	timeoutDuration, err := time.ParseDuration(task.Timeout)
-	if err != nil {
-		timeoutDuration = 30 * time.Second
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
-	defer cancel()
-
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd.exe", "/C", task.Command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", task.Command)
-	}
-
-	//cmd := exec.CommandContext(ctx, "sh", "-c", task.Command)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Error executing task %s: %v. Output: %s.\n", task.Name, err, string(output))
-		return err
-	}
-
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		fmt.Printf("Task %s exceeded timeout %s.\n", task.Name, task.Timeout)
-		return ctx.Err()
-	}
-
-	fmt.Printf("Task %s executed successfully: %s.\n", task.Name, string(output))
-	return nil
-}
-
 // runTasks executes tasks in parallel, respecting dependencies
 func runTasks(tasks []Task) {
 	var wg sync.WaitGroup
 	taskStatus := make(map[string]bool)
-	var mu sync.Mutex // Mutex to safely update taskStatus
+	var mu sync.Mutex
 
 	// Initialize the taskStatus map to track task completion
 	for _, task := range tasks {
@@ -127,7 +68,6 @@ func runTasks(tasks []Task) {
 
 			// Wait for all dependencies to complete
 			for _, dep := range t.DependsOn {
-				// Polling until the dependency is marked as completed
 				for {
 					mu.Lock()
 					if taskStatus[dep] {
@@ -135,28 +75,136 @@ func runTasks(tasks []Task) {
 						break
 					}
 					mu.Unlock()
-					time.Sleep(100 * time.Millisecond) // Sleep for a short time before retrying
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
 
-			// Simulate task execution
-			//fmt.Printf("Running task: %s\n", t.Name)
-			//time.Sleep(2 * time.Second) // Simulate task running
-			//fmt.Printf("Task %s completed\n", t.Name)
-
-			// Mark task as complete if it succeeds
+			// Execute task with retries and timeout
 			success := executeWithRetries(t)
+
 			if success {
 				mu.Lock()
 				taskStatus[t.Name] = true
 				mu.Unlock()
 			} else {
-				fmt.Printf("Task %s failed after %i retries.\n", t.Name, t.Retries)
+				fmt.Printf("Task %s failed after retries\n", t.Name)
 			}
-
 		}(task)
 	}
 
 	wg.Wait()
 	fmt.Println("All tasks completed.")
+}
+
+func executeWithRetries(task Task) bool {
+	retryCount := 0
+	for {
+		if retryCount > task.Retries {
+			fmt.Printf("Task %s exceeded retry limit of %d\n", task.Name, task.Retries)
+			return false
+		}
+
+		// Execute the task based on its type
+		err := executeTask(task)
+		if err == nil {
+			fmt.Printf("Task %s completed successfully\n", task.Name)
+			return true
+		}
+
+		fmt.Printf("Task %s failed: %v. Retrying...\n", task.Name, err)
+		retryCount++
+		time.Sleep(time.Duration(2^retryCount) * time.Second)
+	}
+}
+
+func executeTask(task Task) error {
+	switch task.Type {
+	case "shell":
+		return executeShellTask(task)
+	case "db":
+		return executeDBTask(task)
+	case "http":
+		return executeHTTPTask(task)
+	default:
+		return fmt.Errorf("unsupported task type: %s", task.Type)
+	}
+}
+
+func executeShellTask(task Task) error {
+	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout(task.Timeout))
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "cmd.exe", "/C", task.Command)
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", task.Command)
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Error executing task %s: %v, Output: %s\n", task.Name, err, string(output))
+		return err
+	}
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		fmt.Printf("Task %s timed out\n", task.Name)
+		return ctx.Err()
+	}
+
+	fmt.Printf("Task %s output: %s\n", task.Name, string(output))
+	return nil
+}
+
+func executeDBTask(task Task) error {
+	db, err := sql.Open("postgres", task.DbConn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to the database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(task.Command) // Running the SQL query (e.g., INSERT, UPDATE)
+	if err != nil {
+		return fmt.Errorf("failed to execute query: %v", err)
+	}
+
+	fmt.Printf("Task %s: query executed successfully\n", task.Name)
+	return nil
+}
+
+func executeHTTPTask(task Task) error {
+	client := &http.Client{Timeout: parseTimeout(task.Timeout)}
+	req, err := http.NewRequest(task.Method, task.URL, strings.NewReader(task.Body))
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	fmt.Printf("Task %s: HTTP request to %s completed with status %d\n", task.Name, task.URL, resp.StatusCode)
+	return nil
+}
+
+func scheduleTask(task Task, execute func()) {
+	scheduleTime, err := time.Parse("15:04", task.Schedule)
+	if err != nil {
+		fmt.Printf("Failed to parse schedule time: %v\n", err)
+	}
+	now := time.Now()
+	nextRun := time.Date(now.Year(), now.Month(), now.Day(), scheduleTime.Hour(), scheduleTime.Minute(), 0, 0, now.Location())
+	if nextRun.Before(now) {
+		nextRun = nextRun.Add(24 * time.Hour)
+	}
+	time.AfterFunc(nextRun.Sub(now), execute)
+}
+
+func parseTimeout(timeout string) time.Duration {
+	duration, err := time.ParseDuration(timeout)
+	if err != nil {
+		return 30 * time.Second // Default to 30s if no valid timeout provided
+	}
+	return duration
 }

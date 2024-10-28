@@ -1,4 +1,4 @@
-module GoFlow
+module github.com/matbot/goflow
 
 go 1.21
 
